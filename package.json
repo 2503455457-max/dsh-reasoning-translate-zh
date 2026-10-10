@@ -54,11 +54,11 @@
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/USERNAME/dsh-think-zh.git"
+    "url": "https://gitee.com/USERNAME/dsh-think-zh.git"
   },
-  "homepage": "https://github.com/USERNAME/dsh-think-zh#readme",
+  "homepage": "https://gitee.com/USERNAME/dsh-think-zh#readme",
   "bugs": {
-    "url": "https://github.com/USERNAME/dsh-think-zh/issues"
+    "url": "https://gitee.com/USERNAME/dsh-think-zh/issues"
   },
   "engines": {
     "node": ">=20"
