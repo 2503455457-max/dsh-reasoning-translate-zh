@@ -1,0 +1,17 @@
+# macOS
+.DS_Store
+
+# 构建产物可复现：lib/client.js 由 client.source.js 生成
+# 但发布包需要它（宿主直接加载产物），所以**纳入版本管理**，见 PROVENANCE.md
+
+# 本地配置与缓存（绝不入库）
+config.json
+cache.json
+*.log
+
+# profile 备份（含个人 provider 配置）
+*.bak-*
+cordis.patch.yml.bak*
+
+# 依赖
+node_modules/

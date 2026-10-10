@@ -1,0 +1,66 @@
+{
+  "name": "dsh-think-zh",
+  "version": "0.1.0",
+  "private": true,
+  "description": "把模型的思考过程（reasoning）实时翻译成中文显示：中文在上、英文原文可折叠；翻译引擎可在 DSH 已配置模型与本地 Ollama 之间切换。只作用于显示层，不修改会话记录。",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js"
+  },
+  "files": [
+    "lib",
+    "scripts",
+    "test",
+    "docs",
+    "client.source.js",
+    "cordis.patch.yml",
+    "README.md",
+    "使用说明.md",
+    "CRASH-RECORD.md",
+    "LICENSE",
+    "PROVENANCE.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node test/text.test.mjs && node test/translator.test.mjs && node test/client.test.mjs && node test/registration.test.mjs",
+    "smoke": "node scripts/smoke-client.mjs",
+    "install:desktop": "bash scripts/install-desktop.sh"
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "reasoning",
+    "thinking",
+    "translation",
+    "chinese"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-chat"
+      ]
+    },
+    "compatibility": {
+      "dsh": ">=0.2.0-rc.2"
+    }
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/USERNAME/dsh-think-zh.git"
+  },
+  "homepage": "https://github.com/USERNAME/dsh-think-zh#readme",
+  "bugs": {
+    "url": "https://github.com/USERNAME/dsh-think-zh/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
