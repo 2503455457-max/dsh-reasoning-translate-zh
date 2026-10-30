@@ -1,8 +1,8 @@
 {
   "name": "dsh-think-zh",
-  "version": "0.1.0",
-  "private": true,
-  "description": "把模型的思考过程（reasoning）实时翻译成中文显示：中文在上、英文原文可折叠；翻译引擎可在 DSH 已配置模型与本地 Ollama 之间切换。只作用于显示层，不修改会话记录。",
+  "version": "0.2.0",
+  "private": false,
+  "description": "把模型的思考过程（reasoning）实时翻译成中文：折叠摘要显示中文，展开显示中文正文 + 英文原文；翻译引擎可在 DSH 已配置模型与本地 Ollama 之间切换。只作用于显示层，不修改会话记录。",
   "type": "module",
   "main": "lib/index.js",
   "exports": {
@@ -20,7 +20,8 @@
     "使用说明.md",
     "CRASH-RECORD.md",
     "LICENSE",
-    "PROVENANCE.md"
+    "PROVENANCE.md",
+    "CHANGELOG.md"
   ],
   "scripts": {
     "build": "node scripts/build-client.mjs",
@@ -48,7 +49,7 @@
       ]
     },
     "compatibility": {
-      "dsh": ">=0.2.0-rc.2"
+      "dsh": ">=0.2.1-rc.2"
     }
   },
   "license": "MIT",
