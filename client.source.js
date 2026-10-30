@@ -20,11 +20,26 @@ import { DisclosureRow, IconThinkOutlineRegular, MarkdownText, TextShimmer } fro
 const API = '/dsh-think-zh';
 const SLOT = 'conversation.chat.node';
 const KEY = 'assistant-step';
+/**
+ * DSH 0.2.1 moved the reasoning body into its own slot and made `renderSlot` a
+ * required prop of any entry that declares children. Shadowing the node entry
+ * therefore throws `renderSlot is not a function` there (see the 2026-10-18 crash
+ * log), and the slot system silently falls back to the built-in English renderer.
+ * 0.2.1's supported way in is this child slot, whose default entry sits at
+ * priority 100 — lowest priority renders, so 0 wins.
+ */
+const BODY_SLOT = 'conversation.chat.reasoning.body';
 
-/** How often an actively streaming row may ask for a fresh translation. */
-const TICK_MS = 450;
+/**
+ * How often an actively streaming row may ask for a fresh translation.
+ *
+ * Raised from 450ms: a single streaming row was being sampled ~2x/second, and with
+ * several rows that kept a 1.5B local model at ~95% GPU for as long as anything
+ * streamed. 1200ms halves the request volume while still following the stream.
+ */
+const TICK_MS = 1200;
 /** Extra source characters that must accumulate before another request. */
-const MIN_GROWTH = 24;
+const MIN_GROWTH = 60;
 /** CJK share above which a source counts as already Chinese. */
 const CJK_RATIO = 0.35;
 
@@ -38,6 +53,27 @@ const runtime = {
 /** `nodeKey@sourceLength` -> translated fragments, so remounts cost nothing. */
 const translationCache = new Map();
 const CACHE_LIMIT = 240;
+/**
+ * Per-identity sorted list of covered source lengths.
+ *
+ * Lookups used to scan `length` entries downward on every render — for a 3000-char
+ * reasoning block that is 3000 Map lookups per block per frame, and with dozens of
+ * blocks this showed up as the renderer helper process burning ~30% CPU while a reply
+ * streamed. A sorted index turns each lookup into a binary search.
+ */
+const translationIndex = new Map();
+
+/** First position where `value` can be inserted, keeping the array sorted. */
+function lowerBound(array, value) {
+  let low = 0;
+  let high = array.length;
+  while (low < high) {
+    const mid = (low + high) >> 1;
+    if (array[mid] < value) low = mid + 1;
+    else high = mid;
+  }
+  return low;
+}
 
 /* -------------------------------------------------------------- utilities -- */
 
@@ -64,18 +100,68 @@ function cjkRatio(text) {
  * @returns the new block array plus the translated block list, or null when
  *          nothing could be translated yet
  */
-export function substituteTranslatedBlocks(blocks, nodeKey, lookup) {
+/**
+ * First complete sentence(s) of a reasoning row, used for the collapsed summary line.
+ *
+ * The summary must be cheap: translating the whole block just to show one line is what
+ * kept a local model saturated. Only complete sentences qualify — an unfinished tail
+ * changes on every tick and would re-translate the same prefix forever.
+ *
+ * @param text - reasoning text so far
+ * @param minChars - minimum length before a returned summary is worth translating
+ * @param limit - hard cap so a single huge sentence cannot dominate a request
+ * @returns the stable prefix, or '' while no complete sentence exists yet
+ */
+export function firstCompleteSummary(text, minChars = 40, limit = 320) {
+  const source = String(text ?? '');
+  let end = 0;
+  for (let index = 0; index < source.length; index += 1) {
+    const ch = source[index];
+    const boundary =
+      ch === '\n' ||
+      ('.!?。！？'.includes(ch) && (index + 1 >= source.length || /\s/.test(source[index + 1])));
+    if (!boundary) continue;
+    end = index + 1;
+    if (end >= minChars) break;
+  }
+  if (end < minChars) return '';
+  return source.slice(0, Math.min(end, limit));
+}
+
+/**
+ * Replace reasoning blocks with their translated summary.
+ *
+ * Only `text` is replaced (that is what the collapsed line shows); the full English
+ * source is kept on the block so the expanded body can translate it lazily.
+ *
+ * @param blocks - node blocks
+ * @param nodeKey - node identity base
+ * @param lookup - (identity, length) => translated text | undefined
+ * @returns `{ blocks, translated }` or null when nothing is translated yet
+ */
+export function substituteSummaries(blocks, nodeKey, lookup) {
   if (!Array.isArray(blocks) || blocks.length === 0) return null;
   const translated = [];
   let touched = false;
   const next = blocks.map((block, index) => {
     if (block?.kind !== 'reasoning') return block;
     const source = String(block.text ?? '');
+    if (source.trim() === '') return block;
     const identity = `${nodeKey}#${index}`;
-    const chinese = lookup(identity, source.length);
+    const summarySource = firstCompleteSummary(source);
+    if (summarySource === '') return block;
+    const chinese = lookup(`${identity}#sum`, summarySource.length);
     if (chinese === undefined || chinese === '') return block;
     touched = true;
-    const swapped = translatedBlock({ ...block, identity }, chinese);
+    const swapped = {
+      kind: 'reasoning',
+      text: chinese,
+      english: source,
+      chinese,
+      identity,
+      summarySource,
+      translated: true,
+    };
     translated.push(swapped);
     return swapped;
   });
@@ -91,9 +177,32 @@ export function substituteTranslatedBlocks(blocks, nodeKey, lookup) {
  * @param length - current source length
  */
 export function newestTranslation(identity, length) {
-  for (let size = length; size > 0; size -= 1) {
+  const hit = lookupTranslation(identity, length);
+  return hit === undefined ? undefined : hit.text;
+}
+
+/**
+ * Newest cached translation at or below `length`, together with the source length it
+ * actually covers.
+ *
+ * While a row is streaming the host deliberately leaves the unfinished sentence
+ * untranslated, so a cached value can cover less than the current text. Callers need
+ * that coverage both to decide whether more work is pending and to avoid presenting a
+ * partial translation as if it were complete.
+ *
+ * @param identity - stable key for the reasoning block
+ * @param length - current source length
+ * @returns the translation and its coverage, or undefined when nothing is cached
+ */
+export function lookupTranslation(identity, length) {
+  const sizes = translationIndex.get(identity);
+  if (sizes === undefined) return undefined;
+  /* Last covered length at or below the current one; walk down only while entries
+     are empty (a value is never stored empty, so this normally runs once). */
+  for (let index = lowerBound(sizes, length + 1) - 1; index >= 0; index -= 1) {
+    const size = sizes[index];
     const hit = translationCache.get(`${identity}@${size}`);
-    if (hit !== undefined && hit !== '') return hit;
+    if (hit !== undefined && hit !== '') return { text: hit, size };
   }
   return undefined;
 }
@@ -108,7 +217,55 @@ export function newestTranslation(identity, length) {
  */
 export function rememberTranslation(identity, length, value) {
   translationCache.set(`${identity}@${length}`, value);
-  while (translationCache.size > CACHE_LIMIT) translationCache.delete(translationCache.keys().next().value);
+  const sizes = translationIndex.get(identity);
+  if (sizes === undefined) {
+    translationIndex.set(identity, [length]);
+  } else {
+    const at = lowerBound(sizes, length);
+    if (sizes[at] !== length) sizes.splice(at, 0, length);
+  }
+  while (translationCache.size > CACHE_LIMIT) {
+    const oldest = translationCache.keys().next().value;
+    translationCache.delete(oldest);
+    const split = oldest.lastIndexOf('@');
+    if (split < 0) continue;
+    const owner = oldest.slice(0, split);
+    const size = Number(oldest.slice(split + 1));
+    const owned = translationIndex.get(owner);
+    if (owned === undefined) continue;
+    const index = lowerBound(owned, size);
+    if (owned[index] === size) owned.splice(index, 1);
+    if (owned.length === 0) translationIndex.delete(owner);
+  }
+  for (const listener of translationListeners) {
+    try {
+      listener(identity);
+    } catch {
+      /* a broken subscriber must not break caching */
+    }
+  }
+}
+
+/**
+ * Notification hook for freshly cached translations.
+ *
+ * Without it a settled reasoning row never re-renders: the translation arrives after
+ * the row stopped streaming, the cache is updated, and nothing tells React to look
+ * again — so the row keeps showing English forever (observed 2026-10-22: requests
+ * flowing at ~2/s while every visible summary stayed English). Subscribers are keyed
+ * by identity so only the rows that gained a translation re-render.
+ */
+const translationListeners = new Set();
+
+/**
+ * Subscribe to translation arrivals.
+ *
+ * @param listener - called with the identity that just gained a translation
+ * @returns unsubscribe
+ */
+export function subscribeTranslations(listener) {
+  translationListeners.add(listener);
+  return () => translationListeners.delete(listener);
 }
 
 async function requestJson(path, init) {
@@ -169,8 +326,10 @@ function markdownLabels(t) {
  * @param text - reasoning text received so far
  * @param identity - stable key for this reasoning block
  */
-function useTranslation(text, identity) {
+function useTranslation(text, identity, streaming) {
   const length = text.length;
+  const streamingRef = React.useRef(streaming === true);
+  streamingRef.current = streaming === true;
   const [state, setState] = React.useState(() => {
     const cached = newestTranslation(identity, length);
     return cached === undefined ? { text: '', error: null, busy: false } : { text: cached, error: null, busy: false };
@@ -181,6 +340,14 @@ function useTranslation(text, identity) {
   const abortRef = React.useRef(null);
   const textRef = React.useRef(text);
   textRef.current = text;
+  // Length of the source covered by the last request that was actually sent, so the
+  // scheduler can tell "still growing" from "stalled". This declaration was missing
+  // in the 2026-10-10 build: the timer callback then threw
+  // `ReferenceError: sentRef is not defined` on every tick, which is the wall of
+  // repeated errors in the 2026-10-18 renderer crash log.
+  const sentRef = React.useRef(0);
+  /** True while this row's single in-flight request is being served. */
+  const inFlightRef = React.useRef(false);
 
   React.useEffect(() => {
     if (runtime.config.enabled === false) return undefined;
@@ -188,13 +355,24 @@ function useTranslation(text, identity) {
     if (source.trim().length < (runtime.config.minChars ?? 40)) return undefined;
     if (cjkRatio(source) >= CJK_RATIO) return undefined;
 
-    const cached = newestTranslation(identity, length);
+    const streamingNow = streaming === true;
+    const cached = lookupTranslation(identity, length);
     if (cached !== undefined) {
-      if (stateRef.current.text !== cached) setState({ text: cached, error: null, busy: false });
-      return undefined;
+      if (stateRef.current.text !== cached.text) {
+        setState({ text: cached.text, error: null, busy: false, at: cached.size });
+      }
+      /* Settled and fully covered: there is nothing left to translate. A settled row
+         that is only partially covered still needs its tail, so it must not return. */
+      if (!streamingNow && cached.size >= length) return undefined;
+      /* Streaming: another request is pointless until enough new text arrived. */
+      if (streamingNow && length - cached.size < MIN_GROWTH) return undefined;
     }
     if (timerRef.current !== null) return undefined;
-    if (stateRef.current.text !== '' && length - (stateRef.current.at ?? 0) < MIN_GROWTH) return undefined;
+    /* No cache yet, or a settled row with an uncovered tail: request immediately once
+       the debounce window allows it. */
+    if (cached === undefined && stateRef.current.text !== '' && length - (stateRef.current.at ?? 0) < MIN_GROWTH) {
+      return undefined;
+    }
 
     /**
      * Trailing-edge debounce with back pressure.
@@ -212,29 +390,45 @@ function useTranslation(text, identity) {
      * 50–85s per call while the transcript was actively streaming.
      */
     const send = () => {
+      /* Single-flight per row: never abort-and-restart. Cancelling a request does not
+         necessarily stop the inference behind it, so the old abort-and-resend shape
+         could keep several generations alive at once. One request at a time per row
+         means at most one generation per row, and the newest text goes out as soon as
+         the current one finishes. */
+      if (inFlightRef.current) return;
       const snapshot = textRef.current;
       if (snapshot.length < (runtime.config.minChars ?? 40)) return;
       sentRef.current = snapshot.length;
-      try {
-        abortRef.current?.abort?.();
-      } catch {
-        /* ignore */
-      }
+      inFlightRef.current = true;
       const controller = typeof AbortController === 'function' ? new AbortController() : undefined;
       abortRef.current = controller;
       setState((previous) => ({ ...previous, busy: true, error: null }));
-      post('/translate', { key: identity, text: snapshot }, controller?.signal)
+      const settle = () => {
+        inFlightRef.current = false;
+        if (textRef.current.length - sentRef.current >= MIN_GROWTH && timerRef.current === null) arm();
+      };
+      post(
+        '/translate',
+        { key: identity, text: snapshot, streaming: streamingRef.current },
+        controller?.signal,
+      )
         .then((payload) => {
-          if (abortRef.current !== controller) return; // a newer request owns the state now
+          if (abortRef.current !== controller) return; // unmounted or superseded
           const translated = typeof payload?.text === 'string' ? payload.text : '';
-          if (translated !== '') rememberTranslation(identity, snapshot.length, translated);
-          setState({ text: translated, error: payload?.error ?? null, busy: false, at: snapshot.length });
+          /* Key the cache by what the host actually covered: while streaming the
+             unfinished sentence is left untranslated on purpose, so storing it under
+             the full length would let a partial translation be shown as complete. */
+          const covered =
+            typeof payload?.coveredLength === 'number' ? payload.coveredLength : snapshot.length;
+          if (translated !== '') rememberTranslation(identity, covered, translated);
+          setState({ text: translated, error: payload?.error ?? null, busy: false, at: covered });
         })
         .catch((error) => {
           if (error?.name === 'AbortError') return;
           if (abortRef.current !== controller) return;
           setState((previous) => ({ ...previous, busy: false, error: String(error?.message ?? error) }));
-        });
+        })
+        .finally(settle);
     };
 
     /* Re-arm only when text actually grew since the last send, so a long stream is
@@ -250,7 +444,7 @@ function useTranslation(text, identity) {
     arm();
 
     return undefined;
-  }, [length, identity]);
+  }, [length, identity, streaming]);
 
   React.useEffect(() => () => {
     if (timerRef.current !== null) {
@@ -328,9 +522,49 @@ function OriginalReasoning({ text, labels, streaming }) {
  * @param props.block - `{ identity, english }` for one reasoning block
  * @returns null — this component exists only for its effect
  */
-function TranslationFetcher({ block }) {
-  useTranslation(String(block?.english ?? ''), block?.identity);
+function TranslationFetcher({ block, streaming }) {
+  useTranslation(String(block?.english ?? ''), block?.identity, streaming === true);
   return null;
+}
+
+/**
+ * Body renderer handed to the built-in assistant-step view through `renderSlot`.
+ *
+ * DSH 0.2.1 made `renderSlot` a required prop of entries that declare child slots, and
+ * the assistant-step entry declares `conversation.chat.reasoning.body`. A shadow entry
+ * cannot declare those children again (the registry rejects re-declaration), so the
+ * only way to shadow the node is to supply `renderSlot` ourselves. Without this the
+ * built-in throws `renderSlot is not a function` and the slot system silently falls
+ * back to the English renderer — exactly what the 2026-10-18 crash log shows.
+ *
+ * @param props.chinese - translated body text (already substituted)
+ * @param props.english - original English source for the collapsible block
+ * @param props.running - whether the block is still streaming
+ * @param props.labels - markdown locale labels
+ */
+function TranslatedBody({ chinese, english, identity, running, labels }) {
+  /* Lazily fetches the FULL translation, and only when it is mounted — which happens
+     only for an expanded row. Collapsed rows never pay for their body. */
+  const full = useTranslation(identity === undefined ? '' : english, identity ?? 'body:none', false);
+  const fullText = full.text;
+  const hasFull = identity !== undefined && fullText !== '' && fullText !== english;
+  const bodyText = hasFull ? fullText : chinese;
+  const showEnglish = runtime.config.showOriginal !== false;
+
+  if (bodyText === '' || bodyText === english) {
+    return React.createElement(MarkdownText, { text: english, streaming: running === true, labels, variant: 'compact' });
+  }
+  return React.createElement(
+    'div',
+    { 'data-dsh-think-zh': 'body' },
+    React.createElement(MarkdownText, {
+      text: bodyText,
+      streaming: hasFull ? false : running === true,
+      labels,
+      variant: 'compact',
+    }),
+    showEnglish ? React.createElement(OriginalReasoning, { text: english }) : null,
+  );
 }
 
 function translatedBlock(block, chinese) {
@@ -357,86 +591,6 @@ const THINK_CSS = {
   summaryText: { textOverflow: 'ellipsis', display: 'block', overflow: 'hidden' },
   thinkBody: { padding: '4px 0 4px calc(22px + var(--dsh-content-font-delta, 0px))', minWidth: 0 },
 };
-
-/** First line of the newest completed paragraph, mirroring the built-in summary. */
-function summaryOf(text) {
-  const paragraphs = String(text).split(/\r?\n(?:[\t ]*\r?\n)+/);
-  let summary = '';
-  for (const paragraph of paragraphs) {
-    const line = paragraph.split('\n')[0].trim();
-    if (line !== '') summary = line;
-  }
-  if (summary === '') summary = String(text).split('\n')[0];
-  return summary.replaceAll('**', '');
-}
-
-/**
- * The translated reasoning row: same disclosure affordance as the built-in, with
- * the Chinese text on top and the English source underneath, collapsed.
- */
-function TranslatedReasoningRow({ block, streaming, labels }) {
-  const english = String(block.english ?? '');
-  const [expanded, setExpanded] = React.useState(false);
-  const translation = useTranslation(english, block.identity);
-  const chinese = translation.text !== '' ? translation.text : String(block.chinese ?? '');
-  const running = streaming === true && translation.text === '';
-  const summary = summaryOf(chinese);
-  const preview = !expanded && summary !== '';
-
-  const collapsedContent = React.createElement(
-    React.Fragment,
-    null,
-    React.createElement('span', { style: THINK_CSS.separator, 'data-shimmer-decoration': true, 'aria-hidden': true }),
-    React.createElement(
-      'span',
-      { style: THINK_CSS.summary },
-      React.createElement(
-        'span',
-        { style: THINK_CSS.summaryText },
-        React.createElement(TextShimmer, null, summary),
-      ),
-    ),
-  );
-
-  const body = expanded
-    ? React.createElement(
-        'div',
-        { style: THINK_CSS.thinkBody, 'data-dsh-think-zh': 'body' },
-        translation.text === ''
-          ? React.createElement('div', { style: { ...subtleText, marginBottom: '4px' } }, translation.error !== null ? `翻译不可用：${translation.error}` : '翻译中…')
-          : null,
-        React.createElement(MarkdownText, { text: chinese, streaming: running, labels, variant: 'compact' }),
-        React.createElement(OriginalReasoning, { text: english }),
-      )
-    : undefined;
-
-  return React.createElement(
-    'div',
-    {
-      style: THINK_CSS.root,
-      'data-variant': 'think',
-      'data-translated': true,
-      'data-state': streaming === true ? 'running' : 'ok',
-      'data-expanded': expanded || undefined,
-      'data-preview': preview || undefined,
-      'data-dsh-think-zh': 'row',
-    },
-    React.createElement(DisclosureRow, {
-      rowClassName: undefined,
-      leadingClassName: undefined,
-      titleClassName: undefined,
-      icon: React.createElement(IconThinkOutlineRegular, { size: 14 }),
-      title: '思考',
-      running: streaming === true,
-      open: expanded,
-      expandable: true,
-      expandOnRowClick: true,
-      onToggle: () => setExpanded((value) => !value),
-      collapsedContent,
-      children: body,
-    }),
-  );
-}
 
 /* --------------------------------------------------------------- install -- */
 
@@ -479,7 +633,7 @@ export function apply(ctx) {
     }
     const Builtin = builtin.component;
 
-    const Shadow = (props) => {
+const Shadow = (props) => {
       const node = props?.node;
       const tSeat = props?.t;
       // Render counter, surfaced unconditionally so "never called" is distinguishable
@@ -488,56 +642,84 @@ export function apply(ctx) {
       runtime.lastBlocks = Array.isArray(node?.data?.blocks) ? node.data.blocks.length : -1;
       const labels = React.useMemo(() => markdownLabels(tSeat), [tSeat]);
       const blocks = node?.data?.blocks;
+      /* Re-render this node when one of ITS rows gains a translation. */
+      const [, bumpTranslation] = React.useReducer((value) => value + 1, 0);
+      const identitiesRef = React.useRef(new Set());
+      const identities = new Set();
+      if (Array.isArray(blocks)) {
+        blocks.forEach((block, index) => {
+          if (block?.kind === 'reasoning') identities.add(`${node?.key ?? 'node'}#${index}`);
+        });
+      }
+      identitiesRef.current = identities;
+      React.useEffect(
+        () => subscribeTranslations((identity) => {
+          if (identitiesRef.current.has(identity)) bumpTranslation();
+        }),
+        [],
+      );
       if (runtime.config.enabled === false || !Array.isArray(blocks) || blocks.length === 0) {
         runtime.lastPath = 'passthrough-disabled-or-empty';
-        return React.createElement(Builtin, props);
+        /* 0.2.1 calls renderSlot for the body even while this plugin is off; without it
+           the built-in throws and the slot system falls back to its own renderer. */
+        const plainSlot = (key, owner) =>
+          key === BODY_SLOT
+            ? React.createElement(MarkdownText, {
+                text: String(owner?.text ?? ''),
+                streaming: owner?.running === true,
+                labels,
+                variant: 'compact',
+              })
+            : null;
+        return React.createElement(Builtin, { ...props, renderSlot: plainSlot });
       }
 
       const streaming = node?.data?.status === 'running';
       const nodeKey = node?.key ?? 'node';
-      const swap = substituteTranslatedBlocks(blocks, nodeKey, newestTranslation);
-      runtime.lastPath = swap === null ? 'no-translation-yet' : 'translated';
+      const swap = substituteSummaries(blocks, nodeKey, newestTranslation);
+      runtime.lastPath = swap === null ? 'no-summary-yet' : 'summary-translated';
 
-      /* Mounted on every render, whatever the cache state, so requests are actually
-         issued — see TranslationFetcher for why this cannot live in the translated row. */
-      const fetchers = blocks.map((block, index) =>
-        block?.kind === 'reasoning'
-          ? React.createElement(TranslationFetcher, {
-              key: `fetch-${index}`,
-              block: { identity: `${nodeKey}#${index}`, english: String(block.text ?? '') },
-            })
-          : null,
-      );
+      /* Summary fetchers: one per reasoning block, asking only for the stable prefix.
+         This is what turns "translate everything, live" into "translate one short line
+         per row", keeping a local model from being pinned at full load. */
+      const bodyMap = new Map();
+      const fetchers = [];
+      blocks.forEach((block, index) => {
+        if (block?.kind !== 'reasoning') return;
+        const source = String(block.text ?? '');
+        const identity = `${nodeKey}#${index}`;
+        const swapped = swap === null ? undefined : swap.translated.find((item) => item.identity === identity);
+        if (swapped !== undefined) bodyMap.set(String(swapped.text), { english: source, identity });
+        const summarySource = firstCompleteSummary(source);
+        if (summarySource === '') return;
+        fetchers.push(
+          React.createElement(TranslationFetcher, {
+            key: `summary-${index}`,
+            block: { identity: `${identity}#sum`, english: summarySource },
+            streaming,
+          }),
+        );
+      });
 
-      if (swap === null) {
-        return React.createElement(React.Fragment, null, React.createElement(Builtin, props), fetchers);
-      }
+      const renderSlot = (key, owner) => {
+        if (key !== BODY_SLOT) return null;
+        const text = String(owner?.text ?? '');
+        const entry = bodyMap.get(text);
+        return React.createElement(TranslatedBody, {
+          chinese: text,
+          english: entry === undefined ? text : entry.english,
+          identity: entry === undefined ? undefined : entry.identity,
+          running: owner?.running === true || streaming,
+          labels,
+        });
+      };
 
-      // The built-in renderer keeps drawing the raw English body; our Chinese row
-      // sits above it. The row below is the original, so it stays as evidence.
-      return React.createElement(
-        'div',
-        { 'data-dsh-think-zh': 'pair' },
-        fetchers,
-        React.createElement(
-          'div',
-          { 'data-dsh-think-zh': 'translated-layer' },
-          swap.translated
-            .map((block) =>
-              React.createElement(TranslatedReasoningRow, {
-                key: `zh-${block.identity}`,
-                block,
-                streaming,
-                labels,
-              }),
-            ),
-        ),
-        React.createElement(
-          'div',
-          { 'data-dsh-think-zh': 'original-layer' },
-          React.createElement(Builtin, { ...props, node: { ...node, data: { ...node.data, blocks: swap.blocks } } }),
-        ),
-      );
+      const rendered = React.createElement(Builtin, {
+        ...props,
+        node: swap === null ? node : { ...node, data: { ...node.data, blocks: swap.blocks } },
+        renderSlot,
+      });
+      return React.createElement(React.Fragment, null, rendered, fetchers);
     };
 
     const inject2 = (binding, actions) => {
@@ -570,6 +752,13 @@ export function apply(ctx) {
         builtinInject: typeof builtin.inject,
       };
       report(`pre-register: ${JSON.stringify(runtime.debug)}`);
+      /* The assistant-step entry declares child slots from 0.2.1 on. Shadow entries
+         cannot re-declare them, so Shadow supplies `renderSlot` itself (see
+         TranslatedBody). The flag only records which contract this host has. */
+      runtime.debug = {
+        ...(runtime.debug ?? {}),
+        modernRenderer: builtin?.options?.children !== undefined || builtin?.children !== undefined,
+      };
       dispose = ctx.slots.register({ name: SLOT, key: KEY, priority: -1, locale: 'chat', inject: inject2 }, Shadow);
       runtime.debug.registered = typeof dispose;
       runtime.debug.entriesAfter = ctx.slots.entries(SLOT).length;

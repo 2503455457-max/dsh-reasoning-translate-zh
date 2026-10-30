@@ -1,353 +1,242 @@
 /**
- * Bundle-level test: evaluate the generated `lib/client.js` against a fake module
- * loader and a fake slot context. This is what proves the browser half is
- * syntactically loadable, exports the Cordis plugin face, resolves the built-in
- * renderer and registers the shadow — without needing a browser.
+ * Client bundle behaviour: registration shape, the summary-first rendering contract,
+ * the cache, and the request scheduler.
  *
- * It also exercises the pure block-substitution logic the renderer relies on.
+ * The bundle is loaded through a fake module loader with a fake React, so these tests
+ * exercise the real built artifact rather than the source.
  */
 
 import assert from 'node:assert/strict';
-import { readFile } from 'node:fs/promises';
-import path from 'node:path';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 
-const here = path.dirname(fileURLToPath(import.meta.url));
-const bundlePath = path.join(here, '..', 'lib', 'client.js');
-const bundle = await readFile(bundlePath, 'utf8');
+const bundle = readFileSync(fileURLToPath(new URL('../lib/client.js', import.meta.url)), 'utf8');
 
-/* ------------------------------------------------- fake platform modules -- */
+/* ------------------------------------------------------------- fake platform */
 
-/** Minimal React stand-in: enough for module evaluation, not for rendering. */
+const fakePrimitives = {
+  DisclosureRow: function DisclosureRow() {},
+  IconThinkOutlineRegular: function Icon() {},
+  MarkdownText: function MarkdownText() {},
+  TextShimmer: function TextShimmer() {},
+};
+
 const fakeReact = {
-  createElement: (type, props, ...children) => ({ type, props, children }),
   Fragment: Symbol('Fragment'),
   memo: (component) => component,
+  createElement: (type, props, ...children) => ({ type, props, children }),
   useState: (initial) => [typeof initial === 'function' ? initial() : initial, () => {}],
+  useReducer: (_reducer, initial) => [initial, () => {}],
   useRef: (value) => ({ current: value }),
   useEffect: () => {},
   useMemo: (factory) => factory(),
   useCallback: (callback) => callback,
 };
 
-const exported = {};
-const fakePrimitives = {
-  DisclosureRow: 'DisclosureRow',
-  IconThinkOutlineRegular: 'IconThinkOutlineRegular',
-  MarkdownText: 'MarkdownText',
-  TextShimmer: 'TextShimmer',
-};
-
-const modules = {
-  react: fakeReact,
-  // The bundle does `require('react-dom/client').createRoot`, so the stub must be
-  // the module object, not the function.
-  'react-dom/client': { createRoot: () => ({ render: () => {}, unmount: () => {} }) },
-  '@deepseek-ai/dsh-client-ui-primitives': fakePrimitives,
-};
-
-/* ------------------------------------------------------ fake module loader */
-
 let captured;
-const registered = [];
+const exported = {};
 const loads = [];
+const registered = [];
 
-/* The bundle registers through `window.__ModuleLoader__` (double underscore), the
-   shape all 57 shipped client bundles use; Node has no `window`, so alias it. */
 globalThis.window = globalThis;
 globalThis.__ModuleLoader__ = {
+  mode: 'queue',
   load(spec) {
     loads.push(spec.id);
     captured = spec.factory((id) => {
-      if (!(id in modules)) throw new Error(`unexpected platform require: ${id}`);
-      return modules[id];
+      if (id === 'react') return fakeReact;
+      if (id === 'react-dom/client') return { createRoot: () => ({ render() {}, unmount() {} }) };
+      if (id === '@deepseek-ai/dsh-client-ui-primitives') return fakePrimitives;
+      throw new Error(`unexpected platform require: ${id}`);
     });
   },
 };
+globalThis.document = {
+  documentElement: { setAttribute() {} },
+  head: { appendChild() {} },
+  body: { appendChild() {} },
+  createElement: () => ({ setAttribute() {}, style: {}, appendChild() {} }),
+  querySelector: () => null,
+};
+globalThis.fetch = async () => ({ ok: true, text: async () => JSON.stringify({ config: { enabled: true } }) });
 
 new Function('window', bundle)(globalThis);
-/* The bundle's published face, captured as it registers. */
 Object.assign(exported, captured ?? {});
 
 assert.deepEqual(loads, ['dsh-think-zh'], 'the bundle must register exactly one module');
 assert.equal(typeof captured.apply, 'function', 'the factory must export apply()');
 assert.equal(Array.isArray(captured.inject), true, 'the factory must export an inject array');
-assert.equal(typeof captured.substituteTranslatedBlocks, 'function');
 
-/* ----------------------------------------------------------- the fake host */
+/* ------------------------------------------------------------- fake slot host */
 
-const BUILTIN = function Builtin() {};
-const registeredEntries = [
-  { options: { key: 'user' }, component: function User() {} },
-  { options: { key: 'assistant-step' }, component: BUILTIN, inject: () => ({ hooks: { presentation: 'seat' } }) },
-];
+const BODY_SLOT = 'conversation.chat.reasoning.body';
+const BUILTIN = function AssistantNodeView() {};
+BUILTIN.inject = () => ({ hooks: { presentation: 'seat' } });
+
+const builtinEntry = {
+  options: { key: 'assistant-step', priority: 0, children: { [BODY_SLOT]: { kind: 'single' } } },
+  component: BUILTIN,
+  inject: BUILTIN.inject,
+};
 
 const ctx = {
   slots: {
-    entries: (key) => (key === 'conversation.chat.node' ? registeredEntries : []),
+    entries: (key) => (key === 'conversation.chat.node' ? [builtinEntry] : []),
     register: (options, component) => {
       registered.push({ options, component });
       return () => {};
     },
   },
-  // cordis owns teardown; the plugin registers its disposer through ctx.effect.
   effect: (factory) => {
     const disposer = factory();
     return typeof disposer === 'function' ? disposer : () => {};
   },
 };
 
-/* ------------------------------------------------------------------- checks */
-
 captured.apply(ctx);
 await new Promise((resolve) => setTimeout(resolve, 300));
 
-assert.equal(registered.length, 1, `expected exactly one shadow registration, got ${registered.length}`);
-const [shadow] = registered;
-assert.equal(shadow.options.name, 'conversation.chat.node');
-assert.equal(shadow.options.key, 'assistant-step');
-assert.equal(shadow.options.priority, -1, 'the shadow must win the cell by priority');
+assert.equal(registered.length, 1, `expected one registration, got ${registered.length}`);
+const shadow = registered[0].component;
+assert.equal(registered[0].options.priority, -1, 'the shadow must win the cell by priority');
 
-// The built-in's private hooks must be forwarded or the shadow throws on render.
-const injected = shadow.options.inject('binding-key', 'actions');
-assert.deepEqual(injected, { hooks: { presentation: 'seat' } });
+/* ------------------------------------------------------- summary-first render */
 
-// An unknown platform require must be impossible: apply() already ran clean.
+const LONG_HEAD =
+  'Alpha beta gamma delta epsilon, which is the first complete sentence of this row. ';
+const LONG_TAIL = 'And here comes an unfinished tail that keeps growing without end';
+/** The prefix `firstCompleteSummary` actually returns: the sentence, trailing space cut. */
+const SUMMARY = LONG_HEAD.trimEnd();
 
-/* ------------------------------- the shadow component must actually render --- */
-
-/* Constructing the registered component once is what catches "wrong module shape"
-   bugs: an earlier builder emitted `var React = require("react").React`, which is
-   undefined, so the shadow threw "cannot read properties of undefined (reading
-   'useMemo')" and the chat slot reported `slot entry crashed`. A render-level
-   failure never shows up in a registration-only test. */
-{
-  const shadow = registered[0]?.component;
-  assert.equal(typeof shadow, 'function', 'the shadow must be registered as a component');
-  const props = {
-    node: { key: 'assistant-1', data: { status: 'settled', blocks: [{ kind: 'reasoning', text: 'Some reasoning text for the shadow to render.' }] } },
-    t: (key) => key,
+function renderNode(blocks, status = 'settled') {
+  const seen = [];
+  const original = fakeReact.createElement;
+  fakeReact.createElement = (type, props, ...children) => {
+    seen.push({ type, props, children });
+    return { type, props, children };
   };
-  let out;
+  let tree;
   try {
-    out = shadow(props);
-  } catch (error) {
-    assert.fail(`the shadow component threw when constructed: ${error?.constructor?.name}: ${error?.message}`);
+    tree = shadow({ node: { key: 'node-1', data: { status, blocks } }, t: (key) => key });
+  } finally {
+    fakeReact.createElement = original;
   }
-  assert.notEqual(out, undefined, 'the shadow must return an element');
-  /* With no translation cached it must defer to the built-in renderer. */
-  /* With nothing translated the shadow renders the fetchers alongside the built-in,
-     so the transcript keeps working while a request is in flight. */
-  assert.equal(out.type, fakeReact.Fragment, 'the untranslated shadow must render a Fragment');
+  return { seen, tree };
 }
 
-/* ------------------- the fetch must happen even with an empty cache ---------- */
-
-/* The first implementation only called useTranslation from inside
-   TranslatedReasoningRow, which renders only when a translation is already cached.
-   Nothing ever issued a request, so the chat showed English forever with no error.
-   This walks the rendered tree and requires the fetching component to be mounted
-   even though nothing is translated yet. */
+/* With nothing translated the built-in still renders, but it must receive a
+   renderSlot: DSH 0.2.1 calls it for the reasoning body and a missing one throws. */
 {
-  const originalCreateElement = fakeReact.createElement;
+  const { seen } = renderNode([{ kind: 'reasoning', text: LONG_HEAD + LONG_TAIL }]);
+  const builtin = seen.find((entry) => entry.type === BUILTIN);
+  assert.notEqual(builtin, undefined, 'the built-in renderer must be constructed');
+  assert.equal(typeof builtin.props.renderSlot, 'function', '0.2.1 needs a renderSlot prop');
+  const body = builtin.props.renderSlot(BODY_SLOT, { text: '一些中文', running: false });
+  assert.notEqual(body, undefined, 'the body slot must produce an element');
+  assert.equal(builtin.props.renderSlot('conversation.chat.message.images', {}), null);
+}
+
+/* Only the summary prefix may be requested — never the whole row. */
+{
   const seen = [];
-  let tree;
+  const original = fakeReact.createElement;
   fakeReact.createElement = (type, props, ...children) => {
     seen.push({ type, props, children });
     return { type, props, children };
   };
   try {
-    const shadow = registered[0].component;
-    tree = shadow({
-      node: {
-        key: 'node-42',
-        data: {
-          status: 'settled',
-          blocks: [
-            { kind: 'reasoning', text: 'A reasoning block long enough to be translated by the plugin.' },
-            { kind: 'text', text: 'The answer.' },
-          ],
-        },
-      },
-      t: (key) => key,
-    });
+    shadow({ node: { key: 'node-7', data: { status: 'running', blocks: [{ kind: 'reasoning', text: LONG_HEAD + LONG_TAIL }] } }, t: (k) => k });
   } finally {
-    fakeReact.createElement = originalCreateElement;
+    fakeReact.createElement = original;
   }
+  const fetchers = seen.filter((entry) => typeof entry.type === 'function' && entry.type.name === 'TranslationFetcher');
+  assert.equal(fetchers.length, 1, 'one summary fetcher per reasoning block');
+  const block = fetchers[0].props.block;
+  assert.equal(block.identity, 'node-7#0#sum', 'summary identity must be its own key');
+  assert.equal(block.english, SUMMARY, 'the fetch must cover only the completed prefix');
+  assert.equal(block.english.includes('unfinished tail'), false, 'the tail must never be requested');
+  assert.equal(fetchers[0].props.streaming, true, 'streaming state must be forwarded');
+}
 
-  /* The fetcher must be part of the RETURNED tree, not merely constructed:
-     createElement arguments are evaluated eagerly, so a fetcher that is built but
-     not passed as a child would still show up in `seen` — that is precisely the
-     deadlock this guards against. */
-  const fragment = seen.find((entry) => entry.type === fakeReact.Fragment && Array.isArray(entry.children));
-  assert.notEqual(fragment, undefined, 'the untranslated shadow must construct a Fragment');
-  const children = fragment.children.flat(Infinity).filter(Boolean);
-  const fetchers = children.filter((child) => typeof child.type === 'function' && child.type.name === 'TranslationFetcher');
-  assert.equal(fetchers.length, 1, `the Fragment must contain exactly one fetcher, saw ${fetchers.length}`);
+/* ------------------------------------------------ summary substitution rules */
+
+{
+  const source = `${LONG_HEAD}${LONG_TAIL}`;
+  const summaryLen = SUMMARY.length;
+  const substitute = exported.substituteSummaries;
+  assert.equal(typeof substitute, 'function', 'substituteSummaries must be exported');
+
+  const warm = substitute([{ kind: 'reasoning', text: source }], 'n1', (identity, length) =>
+    identity === 'n1#0#sum' && length === summaryLen ? '阿尔法贝塔伽马。' : undefined,
+  );
+  assert.notEqual(warm, null, 'a warm summary must substitute');
+  assert.equal(warm.translated[0].text, '阿尔法贝塔伽马。', 'block.text becomes the Chinese summary');
+  assert.equal(warm.translated[0].english, source, 'the full English source is kept for the body');
+  assert.equal(warm.translated[0].identity, 'n1#0', 'the body cache identity is the original one');
+
+  const cold = substitute([{ kind: 'reasoning', text: source }], 'n1', () => undefined);
+  assert.equal(cold, null, 'nothing translated means no substitution');
+  assert.equal(substitute([], 'n1', () => 'x'), null);
+  assert.equal(substitute(undefined, 'n1', () => 'x'), null);
+
+  /* A row with no complete sentence yet has no summary to translate. */
+  const running = substitute([{ kind: 'reasoning', text: 'a half sentence that never ends' }], 'n1', () => 'x');
+  assert.equal(running, null, 'an unfinished first sentence yields no summary');
+}
+
+/* ------------------------------------------------------------ summary helper */
+
+{
+  const first = exported.firstCompleteSummary;
+  assert.equal(typeof first, 'function', 'firstCompleteSummary must be exported');
+  const longSentence = 'This first sentence is long enough to be worth translating on its own. And a second one follows.';
+  assert.equal(first(longSentence), longSentence.split(' And ')[0], 'stops after the first complete sentence');
+  assert.equal(first('Short. Tiny.'), '', 'sentences below the minimum length are not summarised yet');
+  assert.equal(first('No terminator at all'), '', 'never returns an unfinished tail');
+  assert.equal(first('a'.repeat(60)), '', 'a single long unfinished sentence is not a summary');
+  assert.equal(first(`${'x'.repeat(30)}. ${'y'.repeat(30)}.`).endsWith('.'), true);
+}
+
+/* ----------------------------------------------------- cache and subscription */
+
+{
+  const remember = exported.rememberTranslation;
+  const lookup = exported.lookupTranslation;
+  const subscribe = exported.subscribeTranslations;
+
+  remember('cov', 86, '中文');
+  assert.deepEqual(lookup('cov', 127), { text: '中文', size: 86 }, 'lookup reports coverage');
+  assert.equal(lookup('cov', 40), undefined);
+
+  const heard = [];
+  const off = subscribe((identity) => heard.push(identity));
+  remember('wake-a', 5, '甲');
+  off();
+  remember('wake-b', 5, '乙');
+  assert.deepEqual(heard, ['wake-a'], 'subscribers hear arrivals until they unsubscribe');
+}
+
+/* ------------------------------------------------------- scheduler invariants */
+
+{
   assert.equal(
-    children.some((child) => child.type === BUILTIN),
+    (bundle.match(/useTranslation\(/g) ?? []).length,
+    3,
+    'only the definition, the summary fetcher and the lazy body may call the hook',
+  );
+  assert.equal(/streaming:\s*streamingRef\.current/.test(bundle), true, 'requests carry the streaming flag');
+  assert.equal(/coveredLength/.test(bundle), true, 'the client keys its cache by covered length');
+  assert.equal(/if \(inFlightRef\.current\) return;/.test(bundle), true, 'single-flight per row');
+  assert.equal(
+    /textRef\.current\.length - sentRef\.current >= MIN_GROWTH\) arm\(\)/.test(bundle),
     true,
-    'the built-in renderer must still be a child while untranslated',
+    'the scheduler re-arms while the source grows',
   );
-  assert.equal(
-    fetchers[0].props.block.identity,
-    'node-42#0',
-    'the fetcher must use the same identity the substitution looks up',
-  );
-  assert.match(
-    fetchers[0].props.block.english,
-    /A reasoning block long enough/,
-    'the fetcher must receive the English source to translate',
-  );
-  assert.equal(
-    fetchers[0].props.block.identity,
-    `node-42#${0}`,
-    'identity must be `<nodeKey>#<blockIndex>`, matching substituteTranslatedBlocks',
-  );
-
-  /* And with an empty cache the shadow must still render the built-in renderer,
-     so the transcript keeps working while the first translation is in flight. */
-  assert.notEqual(tree, undefined, 'the shadow must render something while untranslated');
-}
-
-/* ------------------------------------------- pure substitution behaviour --- */
-
-const lookupWith = (map) => (identity, length) => map[`${identity}@${length}`];
-
-{
-  const blocks = [
-    { kind: 'reasoning', text: 'First think about the slot registry.' },
-    { kind: 'tool-call', name: 'Read' },
-    { kind: 'text', text: 'Here is the answer.' },
-  ];
-  const source = 'First think about the slot registry.';
-  const swap = captured.substituteTranslatedBlocks(blocks, 'assistant-1', lookupWith({
-    [`assistant-1#0@${source.length}`]: '先想想 slot registry。',
-  }));
-  assert.notEqual(swap, null, 'a translated reasoning block must be substituted');
-  assert.equal(swap.blocks.length, 3, 'block count must be preserved');
-  assert.equal(swap.blocks[0].text, '先想想 slot registry。', 'the built-in summary reads the Chinese text');
-  assert.equal(swap.blocks[0].english, source);
-  assert.equal(swap.blocks[0].translated, true);
-  assert.equal(swap.blocks[1], blocks[1], 'non-reasoning blocks must be passed through by identity');
-  assert.equal(swap.blocks[2], blocks[2]);
-  assert.equal(swap.translated.length, 1);
-}
-
-{
-  // No translation yet: nothing is swapped, so the built-in keeps rendering English.
-  const blocks = [{ kind: 'reasoning', text: 'Nothing translated yet.' }];
-  assert.equal(captured.substituteTranslatedBlocks(blocks, 'n', lookupWith({})), null);
-  assert.equal(captured.substituteTranslatedBlocks([], 'n', lookupWith({})), null);
-  assert.equal(captured.substituteTranslatedBlocks(undefined, 'n', lookupWith({})), null);
-}
-
-{
-  // A render can arrive after several characters of growth: the newest translation
-  // at or below the current length must still be found, and a stale length must not
-  // masquerade as one.
-  captured.rememberTranslation('assistant-2#0', 36, '先想想 slot registry。');
-  assert.equal(captured.newestTranslation('assistant-2#0', 36), '先想想 slot registry。');
-  assert.equal(captured.newestTranslation('assistant-2#0', 44), '先想想 slot registry。', 'growth is covered');
-  assert.equal(captured.newestTranslation('assistant-2#0', 35), undefined, 'a shorter source has no translation yet');
-  assert.equal(captured.newestTranslation('other-node#0', 44), undefined, 'identities must not leak');
-
-  const blocks = [{ kind: 'reasoning', text: 'First think about the slot registry. And then more.' }];
-  const swap = captured.substituteTranslatedBlocks(blocks, 'assistant-2', captured.newestTranslation);
-  assert.notEqual(swap, null, 'the cached translation must be reused for a grown source');
-  assert.equal(swap.blocks[0].text, '先想想 slot registry。');
-}
-
-/* ------------- the fetcher's write key must be the substitution's read key ----- */
-
-/* The two halves live in different components: the fetcher writes
-   `<identity>@<sourceLength>` from the props it receives, while the substitution reads
-   `<nodeKey>#<index>@<block.text.length>` off the node. If those ever diverge the
-   plugin goes silent — requests go out, nothing is ever displayed, and no error is
-   raised anywhere. This pins both the identity wiring and the cache round-trip. */
-{
-  const nodeKey = 'node-77';
-  const english = 'The fetcher and the substitution must agree on the cache key.';
-  let captured;
-  const originalCreateElement = fakeReact.createElement;
-  fakeReact.createElement = (type, props, ...children) => {
-    if (typeof type === 'function' && type.name === 'TranslationFetcher') {
-      /* The module's exported helpers, reached through the same object the bundle
-         publishes, so this stays a real round-trip rather than a re-implementation. */
-      captured = {
-        ...props.block,
-        remember: exported.rememberTranslation,
-        newest: exported.newestTranslation,
-        substitute: exported.substituteTranslatedBlocks,
-      };
-    }
-    return { type, props, children };
-  };
-  try {
-    registered[0].component({
-      node: { key: nodeKey, data: { status: 'settled', blocks: [{ kind: 'reasoning', text: english }] } },
-      t: (key) => key,
-    });
-  } finally {
-    fakeReact.createElement = originalCreateElement;
-  }
-
-  assert.notEqual(captured, undefined, 'the fetcher must have been constructed');
-  assert.equal(captured.identity, `${nodeKey}#0`, 'fetcher identity must match the substitution identity');
-  assert.equal(captured.english, english, 'fetcher must receive the exact block text');
-
-  /* Round-trip through the real cache helpers: what the fetcher's identity and
-     source length produce must be exactly what the substitution's lookup finds. */
-  const length = captured.english.length;
-  captured.remember(captured.identity, length, '中文译文。');
-  assert.equal(captured.newest(captured.identity, length), '中文译文。', 'write key must be readable by the substitution');
-  assert.equal(captured.newest(captured.identity, length + 8), '中文译文。', 'a grown source must still find it');
-  assert.equal(captured.newest('some-other-node#0', length), undefined, 'identities must not leak');
-
-  /* And the substitution must actually swap when the cache is warm. */
-  const swap = captured.substitute(
-    [{ kind: 'reasoning', text: english }],
-    nodeKey,
-    captured.newest,
-  );
-  assert.notEqual(swap, null, 'a warm cache must produce a substitution');
-  assert.equal(swap.translated.length, 1);
-  assert.equal(swap.translated[0].text, '中文译文。', 'the swapped block must carry the Chinese as its text');
-  assert.equal(swap.translated[0].english, english, 'the swapped block must keep the English source');
-}
-
-/* ------------------- the scheduler must not starve under streaming ------------- */
-
-/* Field measurement that motivates this block: a translation call took ~1.5s on an
-   idle host but 50–85s while the transcript was streaming. Cause: the effect set its
-   timer once and then returned early on every later render, so during a continuous
-   stream a request either waited for a pause or was throttled against the length of
-   the last *completed* response.
-   The fix is a trailing-edge debounce that always sends the text present when it
-   fires and re-arms while text keeps growing. These are the shapes that pin it. */
-{
-  assert.equal(
-    /\btextRef\.current\b[\s\S]{0,500}?post\('\/translate'/.test(bundle),
-    true,
-    'the send path must read the newest text (textRef.current) rather than a captured snapshot',
-  );
-  assert.equal(
-    /timerRef\.current = setTimeout\(\(\) => \{[\s\S]{0,300}?send\(\)/.test(bundle),
-    true,
-    'the timer callback must call send()',
-  );
-  assert.equal(
-    /send\(\);[\s\S]{0,200}?textRef\.current\.length[\s\S]{0,80}?arm\(\)/.test(bundle),
-    true,
-    'the timer must re-arm while the source keeps growing, otherwise a long stream starves',
-  );
-  /* The old starvation shape: a render that finds a pending timer must not also be
-     the only place a timer is ever created. */
-  assert.equal(
-    /if \(timerRef\.current !== null\) return undefined;[\s\S]{0,120}timerRef\.current = setTimeout/.test(bundle),
-    false,
-    'a pending timer must not be the only scheduling point (that shape starves during streaming)',
-  );
+  /* The shadow passes a locally built `renderSlot` (short-hand property) to the
+     built-in, and supplies one in the disabled branch as well. */
+  assert.equal(/const renderSlot = \(key, owner\)/.test(bundle), true, 'the shadow builds its own renderSlot');
+  assert.equal(/renderSlot,/.test(bundle), true, 'the built-in is given that renderSlot');
+  assert.equal(/renderSlot: plainSlot/.test(bundle), true, 'the disabled branch keeps the built-in renderable');
 }
 
 console.log('client.test.mjs OK');

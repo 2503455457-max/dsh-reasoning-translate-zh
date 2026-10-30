@@ -144,4 +144,70 @@ console.log('translator.test.mjs OK');
   assert.deepEqual(logs, [], `a healthy ratio must stay quiet: ${JSON.stringify(logs)}`);
 }
 
+// --- while streaming, the unfinished tail is not translated -----------------
+/* Field measurement (2026-10-21): a local model sat at ~95% GPU for as long as
+   anything streamed. Cause: every tick re-translated the growing tail, which is new
+   text every time, so one full model call per tick. While streaming only completed
+   sentences may be translated; the tail waits until the row stops growing. */
+{
+  const engine = fakeEngine();
+  const translator = createTranslator({ engine, systemPrompt: 'x', cache: freshCache(), ...options });
+  const text = `${LONG_A} ${LONG_B} ${LONG_C} An unfinished tail that keeps growing`;
+
+  const streaming = await translator.translate({ text, streaming: true });
+  assert.equal(streaming.fragments.some((f) => f.tail === true), false, 'no tail fragment while streaming');
+  assert.equal(streaming.fragments.length, 2, 'only the two completed batches');
+  assert.equal(streaming.coveredLength < text.length, true, 'a partial translation must report a shorter coverage');
+  assert.equal(
+    streaming.coveredLength,
+    text.length - ' An unfinished tail that keeps growing'.length,
+    'coverage must stop exactly where the unfinished sentence starts',
+  );
+  const callsWhileStreaming = engine.calls.length;
+
+  const settled = await translator.translate({ text, streaming: false });
+  assert.equal(settled.fragments.at(-1).tail, true, 'the tail is translated once the row settles');
+  assert.equal(settled.coveredLength, text.length, 'a settled translation covers the whole row');
+  assert.equal(engine.calls.length, callsWhileStreaming + 1, 'settling costs exactly one more call');
+
+  /* And nothing is re-paid when the settled text is asked for again. */
+  const after = engine.calls.length;
+  await translator.translate({ text, streaming: false });
+  assert.equal(engine.calls.length, after, 'a settled row is fully cached');
+}
+
+// --- failing engine opens the breaker instead of queueing forever ------------
+/* When the engine is wedged every queued request adds latency to all others. After a
+   few consecutive failures the translator must stop calling it for a cooldown and
+   answer `skipped: 'circuit-open'` immediately. */
+{
+  let calls = 0;
+  const engine = {
+    id: 'broken',
+    label: 'Broken',
+    async chat() {
+      calls += 1;
+      throw new Error('engine down');
+    },
+  };
+  const translator = createTranslator({ engine, systemPrompt: 'x', cache: freshCache(), ...options });
+  let threw = 0;
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await translator.translate({ text: `${LONG_A} attempt ${attempt}.` });
+    } catch {
+      threw += 1;
+    }
+  }
+  assert.equal(threw, 3, 'failures must surface to the caller');
+  assert.equal(calls, 3, 'one engine call per failed attempt');
+  assert.equal(translator.circuitState().open, true, 'the breaker must open after the threshold');
+
+  const before = calls;
+  const skipped = await translator.translate({ text: `${LONG_B} while open.` });
+  assert.equal(calls, before, 'an open breaker must not touch the engine');
+  assert.equal(skipped.fragments.length, 0);
+  assert.equal(translator.circuitState().retryInMs > 0, true, 'the breaker reports when it retries');
+}
+
 console.log('translator ratio reporting OK');
