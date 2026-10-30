@@ -90,27 +90,35 @@ dsh-think-zh 影子渲染器
 3. **失败要安全。** 影子渲染器只接管 `reasoning` 块，其它块按引用原样透传；渲染抛错时
    插槽会弃用影子条目并回退到内置渲染器。
 
-## 安装（桌面版）
+## 安装
 
-**实测可用的方式**（本插件一直是这样装上的）：
+### 方式一：从 GitHub 安装（推荐）
 
 ```bash
-cd <本目录>
-node scripts/build-client.mjs      # 改了 client.source.js 之后必须重跑
-bash scripts/install-desktop.sh    # 建软链 + 往 profile patch 追加插件行；幂等
-# 然后完全退出并重新打开桌面应用
+# 桌面端
+dsh plugin --profile desktop add git+https://github.com/2503455457-max/dsh-think-zh.git
+# Web profile 把 desktop 换成 web
 ```
 
-脚本做三件事：把本目录软链进 profile 的 `node_modules`、在 `cordis.patch.yml` 末尾追加
-一行插件声明（改写前自动备份）、跑安装前闸门。
+> 桌面端安装前**先完全退出应用**（它的 profile 由 Electron 独占管理）；
+> 装完重新打开应用 —— 刷新页面不够，启动图是启动时快照。
 
-> 另一条路是 `dsh plugin --profile desktop add file:<绝对路径>`（转发给 pnpm）。
-> 本插件**没有实测过那条路**——它要求 pnpm 可用、且应用必须完全退出，
-> 而这个应用的 `desktop` profile 由 Electron 独占管理（CLI 会直接拒绝操作它）。
-> 上面的脚本是验证过的路径。
+### 方式二：本地源码（开发/调试）
 
-**必须重启应用**：桌面端的启动图是宿主启动时的快照，刷新页面不会重新组装，
-实测刷新后 entry 数不变、插件不出现。
+```bash
+cd dsh-think-zh
+node scripts/build-client.mjs      # 改了 client.source.js 之后必须重跑
+bash scripts/install-desktop.sh    # 建软链 + 往 profile patch 追加插件行；幂等
+```
+
+两条路径都已实测：`dsh plugin add file:<路径>` 与 `git+https`（用本地 bare 仓库等价验证）
+都能正确写入 profile 的 `bundles` 与依赖。
+
+### 首次使用
+
+默认引擎是「DSH 已配置模型」——用你账号里当前选中的模型翻译，**会产生模型调用费用**。
+想完全免费、且内容不出本机：装 [Ollama](https://ollama.com) 并 `ollama pull qwen2.5:1.5b`，
+然后在右上角「思」面板里把引擎切成 **Ollama 本地**。
 
 ## 配置
 
