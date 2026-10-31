@@ -1,7 +1,25 @@
-# dsh-think-zh
+# dsh-reasoning-translate-zh
 
-把模型的**思考过程（reasoning）实时翻译成中文**显示：中文在上、英文原文可折叠。
+> 包名（插件 id）是 `dsh-think-zh`，仓库名是 `dsh-reasoning-translate-zh`。
+
+把模型的**思考过程（reasoning）实时翻译成中文**显示：折叠显示中文摘要，展开显示中文正文 + 英文原文。
 只作用于显示层 —— 会话记录、Trajectory、导出文件里的推理文本一个字节都不改。
+
+> ## 与同名项目的区别（重要）
+>
+> 社区里有一批名字相近的插件（如 [Len7183/DSH-Think-zh](https://github.com/Len7183/DSH-Think-zh)、
+> [Muelsyse2023/dsh-think-zh](https://github.com/Muelsyse2023/dsh-think-zh) 等），它们走的是
+> **注入 system prompt 让模型直接用中文思考**的路线。
+>
+> **本插件不注入任何提示词、不改变模型行为。** 模型仍然按它自己的方式（通常是英文）推理，
+> 我们只把结果在**显示层**翻译成中文，并保留可展开的英文原文。
+>
+> | | 提示词注入类 | 本插件 |
+> |---|---|---|
+> | 模型行为 | 被提示词改变 | **完全不变** |
+> | 依赖 | 模型要服从指令，否则无效 | 任何模型都适用 |
+> | 成本 | 零额外调用 | 需一次翻译调用（可全本地 Ollama，零费用） |
+> | 原文 | 只有中文 | **中文 + 可展开英文原文** |
 
 > **v0.2.1** · 已验证环境：DSH 0.2.1-rc.3 / rc.5（macOS 桌面端）
 > · 安装路径：`file:` 与 `git+https://` 两种均已实测
@@ -96,7 +114,7 @@ dsh-think-zh 影子渲染器
 
 ```bash
 # 桌面端
-dsh plugin --profile desktop add git+https://github.com/2503455457-max/dsh-think-zh.git
+dsh plugin --profile desktop add git+https://github.com/2503455457-max/dsh-reasoning-translate-zh.git
 # Web profile 把 desktop 换成 web
 ```
 
