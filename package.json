@@ -1,6 +1,6 @@
 {
   "name": "dsh-think-zh",
-  "version": "0.2.2",
+  "version": "0.2.3",
   "private": false,
   "description": "把模型的思考过程（reasoning）实时翻译成中文：折叠摘要显示中文，展开显示中文正文 + 英文原文；翻译引擎可在 DSH 已配置模型与本地 Ollama 之间切换。只作用于显示层，不修改会话记录。",
   "type": "module",

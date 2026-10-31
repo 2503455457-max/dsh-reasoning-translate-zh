@@ -70,6 +70,7 @@ assert.equal(Array.isArray(captured.inject), true, 'the factory must export an i
 /* ------------------------------------------------------------- fake slot host */
 
 const BODY_SLOT = 'conversation.chat.reasoning.body';
+const IMAGES_SLOT = 'conversation.chat.message.images';
 const BUILTIN = function AssistantNodeView() {};
 BUILTIN.inject = () => ({ hooks: { presentation: 'seat' } });
 
@@ -237,6 +238,88 @@ function renderNode(blocks, status = 'settled') {
   assert.equal(/const renderSlot = \(key, owner\)/.test(bundle), true, 'the shadow builds its own renderSlot');
   assert.equal(/renderSlot,/.test(bundle), true, 'the built-in is given that renderSlot');
   assert.equal(/renderSlot: plainSlot/.test(bundle), true, 'the disabled branch keeps the built-in renderable');
+}
+
+/* ------------------- assistant images must not be dropped ---------------- */
+
+/* We replace the node's renderSlot, so the built-in image slot no longer runs by
+   itself. The standard kit hands every entry a renderFactorySlot binding; delegating
+   to the official gallery factory is what keeps assistant image blocks visible. */
+{
+  const seen = [];
+  const original = fakeReact.createElement;
+  let tree;
+  let capturedFactory = null;
+  fakeReact.createElement = (type, props, ...children) => {
+    seen.push({ type, props, children });
+    return { type, props, children };
+  };
+  try {
+    tree = shadow({
+      node: {
+        key: 'img-1',
+        data: { status: 'settled', blocks: [{ kind: 'reasoning', text: LONG_HEAD }] },
+      },
+      t: (k) => k,
+      renderFactorySlot: (name, props) => {
+        capturedFactory = { name, props };
+        return { type: 'FactoryOutlet', props, children: [] };
+      },
+    });
+  } finally {
+    fakeReact.createElement = original;
+  }
+  const builtin = seen.find((entry) => entry.type === BUILTIN);
+  assert.notEqual(builtin, undefined, 'built-in must render');
+  const images = builtin.props.renderSlot(IMAGES_SLOT, {
+    images: [{ attachment: { id: 'a1' } }],
+    loadImage: () => 'blob:x',
+    align: 'start',
+  });
+  assert.notEqual(images, undefined, 'assistant images must render something, not null');
+  assert.equal(capturedFactory?.name, 'conversation.images.content', 'must use the official gallery factory');
+  assert.deepEqual(capturedFactory?.props?.images, [{ attachment: { id: 'a1' } }], 'image data must be forwarded');
+}
+
+/* ------------------- failures must be visible in the row ----------------- */
+
+{
+  const note = exported.noteTranslationError;
+  const errorOf = exported.translationErrorOf;
+  const subscribe = exported.subscribeTranslationErrors;
+  assert.equal(typeof note, 'function');
+  assert.equal(typeof subscribe, 'function');
+
+  const heard = [];
+  const off = subscribe((identity) => heard.push(identity));
+  note('fail-1#0#sum', '翻译暂停（引擎连续失败）');
+  note('fail-1#0#sum', '翻译暂停（引擎连续失败）'); // 去重
+  assert.deepEqual(heard, ['fail-1#0#sum'], 'state changes notify once');
+  assert.equal(errorOf('fail-1#0#sum'), '翻译暂停（引擎连续失败）');
+  note('fail-1#0#sum', null);
+  assert.equal(errorOf('fail-1#0#sum'), undefined, 'clearing removes the state');
+  off();
+
+  /* A failing row must show the marker in the text the built-in renders. */
+  const seen = [];
+  const original = fakeReact.createElement;
+  note('row-x#0#sum', '翻译暂停（引擎连续失败）');
+  fakeReact.createElement = (type, props, ...children) => {
+    seen.push({ type, props, children });
+    return { type, props, children };
+  };
+  try {
+    shadow({
+      node: { key: 'row-x', data: { status: 'settled', blocks: [{ kind: 'reasoning', text: LONG_HEAD }] } },
+      t: (k) => k,
+    });
+  } finally {
+    fakeReact.createElement = original;
+    note('row-x#0#sum', null);
+  }
+  const builtin = seen.find((entry) => entry.type === BUILTIN);
+  const text = String(builtin?.props?.node?.data?.blocks?.[0]?.text ?? '');
+  assert.equal(text.includes('翻译暂停'), true, 'the failing row must be marked: ' + text.slice(0, 60));
 }
 
 console.log('client.test.mjs OK');

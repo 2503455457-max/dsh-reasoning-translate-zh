@@ -3,6 +3,25 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。DSH 目前处于 rc 阶段，
 插件的小版本可能因上游内部约定变化而包含不兼容调整。
 
+## v0.2.3 — 2026-10-31
+
+补上之前已知的两个功能缺口，并加了自动测试。
+
+### 修复
+
+- **助手消息里的图片不再被吞掉**：影子接管 `renderSlot` 后，`conversation.chat.message.images`
+  原本返回 null。现在把它委托给官方的 `conversation.images.content` 工厂
+  （每个条目都能拿到的标准绑定 `renderFactorySlot`），与内置 `MessageImages` 行为一致；
+  插件被禁用时同样恢复。
+- **翻译失败/熔断在界面上可见**：引擎连续失败触发熔断后，受影响的行会在摘要前显示
+  `（翻译暂停（引擎连续失败））` 标记，而不是静默显示英文、让人以为插件坏了。
+  宿主 `/translate` 响应新增 `circuitOpen` 字段；客户端新增失败状态订阅。
+
+### 新增
+
+- **GitHub Actions**（`.github/workflows/test.yml`）：每次 push / PR 自动跑 4 套测试 +
+  安装闸门，并校验 `lib/client.js` 与 `client.source.js` 一致（防止产物与源码不同步）。
+
 ## v0.2.2 — 2026-10-31
 
 仓库改名与定位说明，代码未变。

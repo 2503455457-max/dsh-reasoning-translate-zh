@@ -29,6 +29,8 @@ const KEY = 'assistant-step';
  * priority 100 — lowest priority renders, so 0 wins.
  */
 const BODY_SLOT = 'conversation.chat.reasoning.body';
+/** Assistant image blocks are rendered through this child slot by the built-in view. */
+const IMAGES_SLOT = 'conversation.chat.message.images';
 
 /**
  * How often an actively streaming row may ask for a fresh translation.
@@ -263,6 +265,51 @@ const translationListeners = new Set();
  * @param listener - called with the identity that just gained a translation
  * @returns unsubscribe
  */
+/**
+ * Rows whose translation is currently failing (engine down, breaker open).
+ *
+ * Without this the UI silently shows English and the user cannot tell "still
+ * translating" from "broken". Shadow subscribes and prefixes those rows with a
+ * visible marker.
+ */
+const translationErrors = new Map();
+const translationErrorListeners = new Set();
+
+/**
+ * Record (or clear) the failure state of one row.
+ * @param identity - row identity (the summary identity)
+ * @param message - error text, or null/'' to clear
+ */
+export function noteTranslationError(identity, message) {
+  const next = message === null || message === undefined || message === '' ? undefined : String(message);
+  const previous = translationErrors.get(identity);
+  if (next === undefined) {
+    if (previous === undefined) return;
+    translationErrors.delete(identity);
+  } else {
+    if (previous === next) return;
+    translationErrors.set(identity, next);
+  }
+  for (const listener of translationErrorListeners) {
+    try {
+      listener(identity);
+    } catch {
+      /* a broken subscriber must not break translation */
+    }
+  }
+}
+
+/** Current failure text for one row, if any. */
+export function translationErrorOf(identity) {
+  return translationErrors.get(identity);
+}
+
+/** Subscribe to failure-state changes; returns an unsubscribe function. */
+export function subscribeTranslationErrors(listener) {
+  translationErrorListeners.add(listener);
+  return () => translationErrorListeners.delete(listener);
+}
+
 export function subscribeTranslations(listener) {
   translationListeners.add(listener);
   return () => translationListeners.delete(listener);
@@ -671,6 +718,10 @@ export function apply(ctx) {
       runtime.lastBlocks = Array.isArray(node?.data?.blocks) ? node.data.blocks.length : -1;
       const labels = React.useMemo(() => markdownLabels(tSeat), [tSeat]);
       const blocks = node?.data?.blocks;
+      /* Every entry receives this binding from the standard kit; the assistant image
+         slot uses it to render through the official gallery factory. Captured so our
+         own renderSlot can delegate instead of dropping assistant images. */
+      const renderFactorySlot = props?.renderFactorySlot;
       /* Re-render this node when one of ITS rows gains a translation. */
       const [, bumpTranslation] = React.useReducer((value) => value + 1, 0);
       const identitiesRef = React.useRef(new Set());
@@ -687,12 +738,29 @@ export function apply(ctx) {
         }),
         [],
       );
+      React.useEffect(
+        () => subscribeTranslationErrors((identity) => {
+          if (identitiesRef.current.has(identity)) bumpTranslation();
+        }),
+        [],
+      );
       if (runtime.config.enabled === false || !Array.isArray(blocks) || blocks.length === 0) {
         runtime.lastPath = 'passthrough-disabled-or-empty';
         /* 0.2.1 calls renderSlot for the body even while this plugin is off; without it
            the built-in throws and the slot system falls back to its own renderer. */
-        const plainSlot = (key, owner) =>
-          key === BODY_SLOT
+        const plainSlot = (key, owner) => {
+          if (key === IMAGES_SLOT) {
+            const factory = props?.renderFactorySlot;
+            if (typeof factory !== 'function') return null;
+            return factory('conversation.images.content', {
+              images: owner?.images,
+              loadImage: owner?.loadImage,
+              align: owner?.align ?? 'start',
+              ...(owner?.compact === undefined ? {} : { compact: owner.compact }),
+              ...(owner?.thumbnail === undefined ? {} : { thumbnail: owner.thumbnail }),
+            });
+          }
+          return key === BODY_SLOT
             ? React.createElement(MarkdownText, {
                 text: String(owner?.text ?? ''),
                 streaming: owner?.running === true,
@@ -700,6 +768,7 @@ export function apply(ctx) {
                 variant: 'compact',
               })
             : null;
+        };
         return React.createElement(Builtin, { ...props, renderSlot: plainSlot });
       }
 
@@ -731,6 +800,18 @@ export function apply(ctx) {
       });
 
       const renderSlot = (key, owner) => {
+        if (key === IMAGES_SLOT) {
+          /* Delegate to the official gallery factory exactly like the built-in
+             MessageImages entry — otherwise assistant image blocks vanish. */
+          if (typeof renderFactorySlot !== 'function') return null;
+          return renderFactorySlot('conversation.images.content', {
+            images: owner?.images,
+            loadImage: owner?.loadImage,
+            align: owner?.align ?? 'start',
+            ...(owner?.compact === undefined ? {} : { compact: owner.compact }),
+            ...(owner?.thumbnail === undefined ? {} : { thumbnail: owner.thumbnail }),
+          });
+        }
         if (key !== BODY_SLOT) return null;
         const text = String(owner?.text ?? '');
         const entry = bodyMap.get(text);
@@ -743,9 +824,23 @@ export function apply(ctx) {
         });
       };
 
+      /* Mark rows whose translation is currently failing, so "broken" is visible and
+         distinguishable from "still translating". */
+      const baseBlocks = swap === null ? blocks : swap.blocks;
+      let markedBlocks = baseBlocks;
+      blocks.forEach((block, index) => {
+        if (block?.kind !== 'reasoning') return;
+        const identity = `${nodeKey}#${index}`;
+        const failure = translationErrorOf(`${identity}#sum`);
+        if (failure === undefined) return;
+        const alreadyTranslated = swap !== null && swap.translated.some((item) => item.identity === identity);
+        if (alreadyTranslated) return;
+        if (markedBlocks === baseBlocks) markedBlocks = baseBlocks.slice();
+        markedBlocks[index] = { ...baseBlocks[index], text: `（${failure}）${String(block.text ?? '')}` };
+      });
       const rendered = React.createElement(Builtin, {
         ...props,
-        node: swap === null ? node : { ...node, data: { ...node.data, blocks: swap.blocks } },
+        node: markedBlocks === blocks ? node : { ...node, data: { ...node.data, blocks: markedBlocks } },
         renderSlot,
       });
       return React.createElement(React.Fragment, null, rendered, fetchers);

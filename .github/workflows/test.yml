@@ -1,0 +1,33 @@
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: unit + bundle tests
+        run: |
+          node test/text.test.mjs
+          node test/translator.test.mjs
+          node test/client.test.mjs
+          node test/registration.test.mjs
+
+      - name: install gate (pre-install hard gate)
+        run: node scripts/smoke-client.mjs
+
+      # The committed lib/client.js must match client.source.js, otherwise the
+      # published artifact silently differs from the reviewed source.
+      - name: committed bundle matches source
+        run: |
+          node scripts/build-client.mjs
+          git diff --exit-code lib/client.js
