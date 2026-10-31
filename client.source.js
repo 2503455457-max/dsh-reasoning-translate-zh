@@ -632,13 +632,42 @@ export function apply(ctx) {
       return;
     }
     const Builtin = builtin.component;
+      /**
+       * A throw anywhere inside the shadow makes the slot outlet fall back to the
+       * built-in renderer with no visible error — which is how the plugin can look
+       * "installed but dead". Render through a boundary that reports failures to the
+       * host (/dsh-think-zh/log) so they can be diagnosed without a console.
+       */
+      const Shadow = (props) => {
+        try {
+          return renderShadow(props);
+        } catch (error) {
+          const detail = String(error?.stack ?? error?.message ?? error);
+          runtime.lastError = detail;
+          report(`shadow render error: ${detail}`);
+          const labels = markdownLabels(props?.t);
+          return React.createElement(Builtin, {
+            ...props,
+            renderSlot: (key, owner) =>
+              key === BODY_SLOT
+                ? React.createElement(MarkdownText, {
+                    text: String(owner?.text ?? ''),
+                    streaming: owner?.running === true,
+                    labels,
+                    variant: 'compact',
+                  })
+                : null,
+          });
+        }
+      };
 
-const Shadow = (props) => {
+    const renderShadow = (props) => {
       const node = props?.node;
       const tSeat = props?.t;
       // Render counter, surfaced unconditionally so "never called" is distinguishable
       // from "called but nothing to show".
       runtime.renders = (runtime.renders ?? 0) + 1;
+      if (runtime.renders === 1) report('shadow rendered its first node');
       runtime.lastBlocks = Array.isArray(node?.data?.blocks) ? node.data.blocks.length : -1;
       const labels = React.useMemo(() => markdownLabels(tSeat), [tSeat]);
       const blocks = node?.data?.blocks;
