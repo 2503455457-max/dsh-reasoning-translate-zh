@@ -3,6 +3,25 @@
 本项目遵循 [语义化版本](https://semver.org/lang/zh-CN/)。DSH 目前处于 rc 阶段，
 插件的小版本可能因上游内部约定变化而包含不兼容调整。
 
+## v0.2.4 — 2026-11-04
+
+修复一个从「摘要优先」重构（v0.2.0）起就存在的显示 bug。
+
+### 修复
+
+- **折叠摘要不刷新（一直显示英文，展开却有中文）**：影子渲染器订阅译文到达时用的
+  身份是 `<node>#<index>`，而摘要译文实际存于 `<node>#<index>#sum`，两者永远匹配不上，
+  折叠行因此不会重渲染。展开后的正文由 `TranslatedBody` 自己的 state 驱动，所以看起来
+  「展开有中文、收起是英文」。现在订阅身份与请求/缓存身份统一为 `#sum`。
+- 新增回归断言：订阅身份必须带 `#sum`，失败标记也使用同一身份。
+
+### 验证
+
+- 4 套测试 + 安装闸门全绿
+- DSH 0.2.2-rc.1（2026-11-04 自动更新）上：契约未变（`conversation.chat.reasoning.body`、
+  `message.images`、`assistant-step`、`renderSlot` 均在；新增的 `inject(sessionId)`
+  与 `resolveFilePath`/`fileMentions` hooks 由影子透传），展开正文中文正常
+
 ## v0.2.3 — 2026-10-31
 
 补上之前已知的两个功能缺口，并加了自动测试。

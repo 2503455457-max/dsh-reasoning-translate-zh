@@ -728,7 +728,10 @@ export function apply(ctx) {
       const identities = new Set();
       if (Array.isArray(blocks)) {
         blocks.forEach((block, index) => {
-          if (block?.kind === 'reasoning') identities.add(`${node?.key ?? 'node'}#${index}`);
+          /* Must match the identity the summary fetcher stores under (#sum), otherwise
+             a collapsed row never re-renders when its translation arrives and stays
+             English while the expanded body is already translated. */
+          if (block?.kind === 'reasoning') identities.add(`${node?.key ?? 'node'}#${index}#sum`);
         });
       }
       identitiesRef.current = identities;

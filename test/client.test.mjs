@@ -322,4 +322,22 @@ function renderNode(blocks, status = 'settled') {
   assert.equal(text.includes('翻译暂停'), true, 'the failing row must be marked: ' + text.slice(0, 60));
 }
 
+/* ------------------- subscription identity must match the fetch key ------------ */
+
+/* 2026-11-04 regression: the shadow subscribed with `<node>#<index>` while summaries
+   are stored under `<node>#<index>#sum`, so a collapsed row never re-rendered when its
+   translation arrived — the expanded body was Chinese, the summary stayed English. */
+{
+  assert.equal(
+    /identities\.add\(`\$\{node\?\.key \?\? 'node'\}#\$\{index\}#sum`\)/.test(bundle),
+    true,
+    'the subscription identity must include the #sum suffix used by the summary fetcher',
+  );
+  assert.equal(
+    /translationErrorOf\(`\$\{identity\}#sum`\)/.test(bundle),
+    true,
+    'failure markers must use the same summary identity',
+  );
+}
+
 console.log('client.test.mjs OK');
